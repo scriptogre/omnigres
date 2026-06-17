@@ -26,8 +26,8 @@ echo "engine check: orioledb db -> $(docker exec "$C" psql -U postgres -d postgr
 echo "             heapdb     -> $(docker exec "$C" psql -U postgres -d heapdb  -tAc "select coalesce((select amname from pg_am a join pg_class c on c.relam=a.oid where relname='accounts'),'heap')")"
 
 echo; echo "===== transfer alpha=0, 8 clients (synchronous_commit=off) ====="
-echo -n "orioledb : "; pgbench_run "$C" postgres 8 30 /tmp/transfer_a0.sql
-echo -n "heap     : "; pgbench_run "$C" heapdb   8 30 /tmp/transfer_a0.sql
+echo -n "orioledb : "; pgbench_run "$C" postgres postgres 8 30 /tmp/transfer_a0.sql
+echo -n "heap     : "; pgbench_run "$C" heapdb   postgres 8 30 /tmp/transfer_a0.sql
 
 echo; echo "===== WAL bytes per transfer (fsync on, full_page_writes on) ====="
 docker exec "$C" psql -U postgres -tAc "alter system set fsync=on; alter system set full_page_writes=on;" >/dev/null 2>&1

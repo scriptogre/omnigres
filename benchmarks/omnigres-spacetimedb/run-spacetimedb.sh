@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run SpacetimeDB's OWN keynote-2 transfer benchmark on this machine, so the
 # comparison is same-hardware / same-harness. Requires: docker, node>=22, pnpm, git.
+# Patched for macOS (sed -i, local CLI, node path).
 set -uo pipefail
 WORK="${WORK:-/tmp/stdb-bench}"
 IMG=clockworklabs/spacetime:latest
@@ -10,10 +11,7 @@ docker rm -f stdb >/dev/null 2>&1
 docker run -d --name stdb -p 127.0.0.1:3000:3000 "$IMG" start --listen-addr 0.0.0.0:3000 >/dev/null
 sleep 5
 
-echo "## 2. extract the spacetime CLI to host (harness calls it directly)"
-cid=$(docker create "$IMG"); sudo docker cp "$cid":/opt/spacetime /opt/spacetime; docker rm "$cid" >/dev/null
-sudo ln -sf /opt/spacetime/spacetimedb-cli /usr/local/bin/spacetime
-export PATH=/usr/local/bin:$PATH
+echo "## 2. using local spacetime CLI (already installed)"
 spacetime --version | tail -1
 
 echo "## 3. fetch the keynote-2 benchmark (sparse checkout)"
@@ -24,7 +22,7 @@ cd "$WORK/templates/keynote-2"
 
 echo "## 4. repoint the workspace SDK dep to the published npm version (matches server)"
 SDKVER=$(spacetime --version | grep -oE 'version [0-9.]+' | head -1 | awk '{print $2}')
-sed -i "s/\"spacetimedb\": \"workspace:[^\"]*\"/\"spacetimedb\": \"$SDKVER\"/" package.json spacetimedb/package.json
+sed -i '' "s/\"spacetimedb\": \"workspace:[^\"]*\"/\"spacetimedb\": \"$SDKVER\"/" package.json spacetimedb/package.json
 pnpm install --no-frozen-lockfile
 ( cd spacetimedb && pnpm install --no-frozen-lockfile )
 
@@ -45,15 +43,15 @@ MAX_INFLIGHT_PER_WORKER=40
 USE_DOCKER=0
 EOF
 
-echo "## 6. run the bench (Node 22 explicitly; pnpm may pin an older node)"
+echo "## 6. run the bench"
 # durable (confirmed reads on), alpha 0 and 1.5
 for A in 0 1.5; do
   echo "--- SpacetimeDB durable, alpha=$A ---"
-  /opt/node22/bin/node --import tsx src/cli.ts --connectors spacetimedb \
+  node --import tsx src/cli.ts --connectors spacetimedb \
     --alpha "$A" --seconds 60 --concurrency 64 2>&1 | grep -iE "completed within|done"
 done
 echo "--- SpacetimeDB NO durability (confirmed_reads=0), alpha=0 ---"
-STDB_CONFIRMED_READS=0 /opt/node22/bin/node --import tsx src/cli.ts --connectors spacetimedb \
+STDB_CONFIRMED_READS=0 node --import tsx src/cli.ts --connectors spacetimedb \
   --alpha 0 --seconds 45 --concurrency 64 2>&1 | grep -iE "completed within|done"
 
 echo
