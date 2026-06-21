@@ -1,0 +1,101 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+instance:
+  init:
+  - create extension omni_python cascade
+  - insert
+    into
+        omni_python.config (name, value)
+    values
+        ('pip_find_links', '../../../python-wheels'),
+        ('site_packages', 'omni_python_test_django')
+  - query: select omni_python.install_requirements($1)
+    params:
+    - |
+      omni_python
+      omni_python_django
+
+tests:
+
+- name: Django connection cursor SELECT 1
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+
+      import django
+      from django.conf import settings
+      if not settings.configured:
+          settings.configure(
+              DATABASES={'default': {'ENGINE': 'omni_python_django', 'NAME': 'omni'}},
+              INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+              USE_TZ=False,
+          )
+          django.setup()
+
+      @pg
+      def dj_select_one() -> int:
+          from django.db import connection
+          with connection.cursor() as cur:
+              cur.execute("SELECT 1")
+              return cur.fetchone()[0]
+  - query: select dj_select_one() as r
+    results:
+      - r: 1
+
+- name: Django ORM Model save and query
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+
+      import django
+      from django.conf import settings
+      if not settings.configured:
+          settings.configure(
+              DATABASES={'default': {'ENGINE': 'omni_python_django', 'NAME': 'omni'}},
+              INSTALLED_APPS=['django.contrib.contenttypes', 'django.contrib.auth'],
+              USE_TZ=False,
+          )
+          django.setup()
+
+      from django.db import models, connection
+
+      class Note(models.Model):
+          title = models.CharField(max_length=200)
+          body = models.TextField()
+          class Meta:
+              app_label = 'omni_dj_test'
+              db_table = 'dj_notes'
+
+      @pg
+      def dj_orm_basic() -> str:
+          with connection.schema_editor() as editor:
+              editor.create_model(Note)
+          try:
+              Note.objects.create(title='hello', body='world')
+              Note.objects.create(title='foo', body='bar')
+              n = Note.objects.count()
+              if n != 2:
+                  return f"count {n}"
+              note = Note.objects.get(title='hello')
+              if note.body != 'world':
+                  return f"body {note.body!r}"
+              # update
+              Note.objects.filter(title='foo').update(body='baz')
+              if Note.objects.get(title='foo').body != 'baz':
+                  return "update failed"
+              # delete
+              Note.objects.filter(title='hello').delete()
+              if Note.objects.count() != 1:
+                  return "delete failed"
+              return "ok"
+          finally:
+              with connection.schema_editor() as editor:
+                  editor.delete_model(Note)
+  - query: select dj_orm_basic() as r
+    results:
+      - r: 'ok'

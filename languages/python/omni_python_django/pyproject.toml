@@ -1,0 +1,22 @@
+[project]
+name = "omni_python_django"
+version = "0.1.0"
+description = "Django database backend for omni_python (in-database driver)"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Framework :: Django"
+]
+
+dependencies = [
+    "omni_python==0.1.0",
+    "Django>=4.2",
+    # Django's postgresql backend imports psycopg2 at module load time.
+    # We swap out the actual connection (see base.py), but the import must
+    # succeed first.
+    "psycopg2-binary"
+]
