@@ -2,6 +2,8 @@ import typing
 from typing import Any, TypedDict, Optional
 from dataclasses import dataclass
 
+from . import dbapi
+
 
 @dataclass
 class pgtype:

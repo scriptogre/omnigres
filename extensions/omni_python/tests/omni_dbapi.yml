@@ -55,7 +55,7 @@ tests:
           try:
               cur.execute("INSERT INTO employees (name, department, salary) VALUES ($1, $2, $3)", [name, deparment, salary])
           except:
-              con.rollback()
+              conn.rollback()
               return "Failed"
           conn.commit()
           cur.close()
@@ -75,7 +75,7 @@ tests:
           try:
               cur.execute("INSERT INTO employees (name, department, salary) VALUES ($1, $2, $3)", [name, deparment, salary])
           except:
-              con.rollback()
+              conn.rollback()
               return "Failed"
           cur.close()
           conn.close()

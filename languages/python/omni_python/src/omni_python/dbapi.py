@@ -31,6 +31,7 @@ A Python DB-API compatible (sort of) interface on top of PL/Python
 __author__ = "Peter Eisentraut <peter@eisentraut.org>"
 
 
+import datetime
 import decimal
 import plpy
 import sys
@@ -52,16 +53,11 @@ threadsafety = 0  # Threads may not share the module.
 paramstyle = 'format'
 
 
-if sys.version[0] == '3':
-    long = int
-    StandardError = Exception
-
-
-class Warning(StandardError):
+class Warning(Exception):
     pass
 
 
-class Error(StandardError):
+class Error(Exception):
     def __init__(self, spierror=None):
         super(Error, self).__init__()
         self.spierror = spierror
@@ -122,6 +118,17 @@ class Connection:
     def __init__(self):
         pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.closed:
+            return
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
     def close(self):
         if self.closed:
             raise Error()
@@ -174,6 +181,12 @@ class Cursor:
 
     def __init__(self):
         pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def close(self):
         self.closed = True
@@ -238,8 +251,6 @@ class Cursor:
             pgtype = 'numeric'
         elif isinstance(param, float):
             pgtype = 'float8'
-        elif isinstance(param, long):
-            pgtype = 'int'
         elif isinstance(param, int):
             pgtype = 'int'
         else:
@@ -313,31 +324,31 @@ class Cursor:
 
 
 def Date(year, month, day):
-    return '%04d-%02d-%02d' % (year, month, day)
+    return datetime.date(year, month, day)
 
 
 def Time(hour, minute, second):
-    return '%02d:%02d:%02d' % (hour, minute, second)
+    return datetime.time(hour, minute, second)
 
 
 def Timestamp(year, month, day, hour, minute, second):
-    return '%04d-%02d-%02d %02d:%02d:%02d' % (year, month, day, hour, minute, second)
+    return datetime.datetime(year, month, day, hour, minute, second)
 
 
 def DateFromTicks(ticks):
-    return Date(*time.localtime(ticks)[:3])
+    return datetime.date(*time.localtime(ticks)[:3])
 
 
 def TimeFromTicks(ticks):
-    return Time(*time.localtime(ticks)[3:6])
+    return datetime.time(*time.localtime(ticks)[3:6])
 
 
 def TimestampFromTicks(ticks):
-    return Timestamp(*time.localtime(ticks)[:6])
+    return datetime.datetime(*time.localtime(ticks)[:6])
 
 
-def Binary(string):
-    return string
+def Binary(value):
+    return value if isinstance(value, (bytes, bytearray, memoryview)) else bytes(value)
 
 
 # Type objects
