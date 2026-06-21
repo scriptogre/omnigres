@@ -9,4 +9,5 @@ add_python_package(py_omni_python_django
         SOURCES
         src/omni_python_django/__init__.py
         src/omni_python_django/base.py
+        src/omni_python_django/_mogrify.py
         )

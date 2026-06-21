@@ -3,9 +3,12 @@ Python DB-API 2.0 driver for omni_python, on top of PL/Python's plpy.
 
 PEP 249: https://peps.python.org/pep-0249/
 
+Pure DB-API + omnigres-specific type/error handling. Anything an individual
+ORM expects beyond PEP 249 (psycopg2's mogrify/server_version, pg8000's
+py_types, etc.) lives in that ORM's adapter package, not here.
+
 Skeleton from plpydbapi by Peter Eisentraut (PostgreSQL License).
-Type-mapping and exception-classification ideas inspired by pg8000 (BSD-3)
-and psycopg2's sqlstate categories.
+Sqlstate categories follow psycopg2's classification.
 """
 
 import datetime
@@ -141,37 +144,7 @@ def _convert_row(row, description):
     return tuple(out)
 
 
-# --- Type mapping (param side) ---
-
-def _sql_literal(value):
-    """Render a Python value as a Postgres SQL literal. For cursor.mogrify."""
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float, decimal.Decimal)):
-        return str(value)
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return "'\\\\x" + bytes(value).hex() + "'::bytea"
-    if isinstance(value, datetime.datetime):
-        return f"'{value.isoformat()}'::{'timestamptz' if value.tzinfo else 'timestamp'}"
-    if isinstance(value, datetime.date):
-        return f"'{value.isoformat()}'::date"
-    if isinstance(value, datetime.time):
-        return f"'{value.isoformat()}'::time"
-    if isinstance(value, datetime.timedelta):
-        return f"'{value.total_seconds()} seconds'::interval"
-    if isinstance(value, uuid.UUID):
-        return f"'{value}'::uuid"
-    if isinstance(value, dict):
-        s = json.dumps(value, default=_json_default).replace("'", "''")
-        return f"'{s}'::jsonb"
-    if isinstance(value, (list, tuple)):
-        elems = ",".join(_sql_literal(v) for v in value)
-        return f"ARRAY[{elems}]"
-    s = str(value).replace("'", "''")
-    return f"'{s}'"
-
+# --- Param-side type mapping ---
 
 def _json_default(obj):
     if isinstance(obj, decimal.Decimal):
@@ -219,45 +192,11 @@ def _pg_type_for(value):
     return ("text", str(value))
 
 
-# --- Default Python-type to PG-OID mapping ---
-# SQLAlchemy's pg8000 dialect looks up py_types[T] to learn the OID for a
-# parameter of Python type T. Our cursor.execute does its own type inference
-# via _pg_type_for, so the encoder slot is a no-op identity.
-
-class _PyTypes(dict):
-    """Dict-like: missing Python types fall back to text+no-op."""
-    def __missing__(self, key):
-        return (25, lambda v: v)  # text OID, identity encoder
-
-
-def _default_py_types():
-    nop = lambda v: v  # noqa: E731
-    return _PyTypes({
-        bool: (16, nop),
-        bytes: (17, nop),
-        bytearray: (17, nop),
-        memoryview: (17, nop),
-        str: (25, nop),
-        int: (20, nop),
-        float: (701, nop),
-        decimal.Decimal: (1700, nop),
-        datetime.date: (1082, nop),
-        datetime.time: (1083, nop),
-        datetime.datetime: (1184, nop),
-        datetime.timedelta: (1186, nop),
-        uuid.UUID: (2950, nop),
-        dict: (3802, nop),
-        list: (1009, nop),
-        tuple: (1009, nop),
-        type(None): (25, nop),
-    })
-
-
 # --- Module-level API ---
 
 def connect(dsn=None, **kwargs):
-    """Return a Connection. Accepts and ignores DSN/kwargs so SQLAlchemy-style
-    URLs do not blow up; we are already inside the database."""
+    """Return a Connection. Accepts and ignores DSN/kwargs so DSN-style URLs
+    do not blow up; we are already inside the database."""
     return Connection()
 
 
@@ -277,27 +216,10 @@ class Connection:
 
     def __init__(self):
         self.closed = False
-        # Match psycopg2/PEP 249: connections start transactional. SQLAlchemy
-        # and most ORMs expect this; flip explicitly to True for fire-and-forget
-        # statement execution.
+        # Match psycopg2/PEP 249: connections start transactional. Most ORMs
+        # expect this; flip to True for fire-and-forget statement execution.
         self.autocommit = False
         self._subxact = None
-        self._server_version_cache = None
-        # SQLAlchemy's pg8000 dialect looks up py_types[T] and may also
-        # register extra encoders here. We accept everything; plpy handles
-        # the real encoding so the entries are essentially metadata.
-        self.py_types = _default_py_types()
-
-    @property
-    def server_version(self):
-        """PG server version as an int (psycopg2-compatible). Peewee reads this."""
-        if self._server_version_cache is None:
-            try:
-                row = plpy.execute("SHOW server_version_num")[0]
-                self._server_version_cache = int(row["server_version_num"])
-            except Exception:
-                self._server_version_cache = 0
-        return self._server_version_cache
 
     def __enter__(self):
         return self
@@ -345,12 +267,6 @@ class Connection:
 
 # SPI status codes from PG (executor/spi.h). Inlined to avoid C import.
 _SPI_OK_UTILITY = 4
-_SPI_OK_SELECT = 5
-_SPI_OK_INSERT_RETURNING = 11
-_SPI_OK_DELETE_RETURNING = 12
-_SPI_OK_UPDATE_RETURNING = 13
-_RESULT_STATUSES = {_SPI_OK_SELECT, _SPI_OK_INSERT_RETURNING,
-                    _SPI_OK_DELETE_RETURNING, _SPI_OK_UPDATE_RETURNING}
 
 
 class Cursor:
@@ -473,8 +389,9 @@ class Cursor:
 
     def fetchone(self):
         self._check_open()
-        # PEP 249 says raise if no result set, but SQLAlchemy calls fetchone()
-        # routinely after DDL etc. Returning None is the practical convention.
+        # PEP 249 says raise if no result set, but SQLAlchemy and friends call
+        # fetchone() routinely after DDL etc. Returning None is the practical
+        # convention every real-world driver follows.
         if not self._rows or self.rownumber >= len(self._rows):
             return None
         row = self._rows[self.rownumber]
@@ -516,18 +433,6 @@ class Cursor:
 
     def setinputsizes(self, sizes): pass
     def setoutputsize(self, size, column=None): pass
-
-    def mogrify(self, operation, parameters=None):
-        """psycopg2-compatible: return SQL with parameters rendered inline.
-
-        Returns bytes, matching psycopg2 (Django calls .decode() on it).
-        """
-        if not parameters:
-            result = operation
-        else:
-            rendered = tuple(_sql_literal(p) for p in parameters)
-            result = operation % rendered if "%s" in operation else operation
-        return result.encode("utf-8") if isinstance(result, str) else result
 
 
 # --- DB-API 2.0 type constructors (PEP 249 section 7) ---
