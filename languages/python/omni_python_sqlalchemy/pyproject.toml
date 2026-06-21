@@ -1,6 +1,6 @@
 [project]
 name = "omni_python_sqlalchemy"
-version = "0.1.0"
+version = "0.1.1"
 description = "SQLAlchemy dialect for omni_python (in-database driver)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,5 +16,16 @@ dependencies = [
     "sqlalchemy>=2.0"
 ]
 
+[project.optional-dependencies]
+# Install with `pip install omni_python_sqlalchemy[testing]` to run the
+# bundled SA dialect compliance suite via runner.run_compliance().
+testing = ["pytest>=7"]
+
 [project.entry-points."sqlalchemy.dialects"]
 "postgresql.omni_python" = "omni_python_sqlalchemy:PGDialect_omni_python"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"omni_python_sqlalchemy._compliance" = ["setup.cfg"]

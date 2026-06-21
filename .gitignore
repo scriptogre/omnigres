@@ -25,3 +25,10 @@ __pycache__
 
 # pkgs
 *.rpm
+
+# Local test loop scaffold (not upstreamed)
+Dockerfile.test
+docker-compose.test.yml
+
+# Artifacts dumped by the SA compliance runner on each in-DB run.
+.sa_compliance_last.json

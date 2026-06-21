@@ -1,0 +1,46 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+# SA dialect compliance smoke: a single canonical SA test, pinned at 1 passed / 0 failed.
+# The full-suite run lives in omni_dbapi_sqlalchemy_compliance_full.yml because SA's
+# pytest plugin holds a process-global asyncio Runner that can't be reused after close,
+# so each pytest.main() invocation needs a fresh Python session (= separate yml).
+
+instance:
+  init:
+  - create extension omni_python cascade
+  - insert
+    into
+        omni_python.config (name, value)
+    values
+        ('pip_find_links', '../../../python-wheels'),
+        ('site_packages', 'omni_python_test_sqlalchemy_compliance')
+  - query: select omni_python.install_requirements($1)
+    params:
+    - |
+      omni_python
+      omni_python_sqlalchemy
+      pytest>=7
+
+tests:
+
+- name: SA compliance suite, smoke (PingTest::test_do_ping)
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      from omni_python_sqlalchemy.runner import run_compliance_json
+
+      @pg
+      def sa_compliance_smoke() -> str:
+          return run_compliance_json(node_filter="test_do_ping and not Escaping")
+  - query: |
+      with r as (select sa_compliance_smoke()::jsonb as j)
+      select (j->>'exit_code')::int as exit_code,
+             (j->>'passed')::int    as passed,
+             (j->>'failed')::int    as failed
+      from r
+    results:
+    - exit_code: 0
+      passed: 1
+      failed: 0

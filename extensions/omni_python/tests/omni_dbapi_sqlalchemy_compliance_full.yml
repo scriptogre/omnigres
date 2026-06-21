@@ -1,0 +1,50 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+# SA dialect compliance, FULL run: invokes pytest with no -k filter against the
+# entire bundled SA compliance suite. Lives in its own yml so SA's process-global
+# asyncio Runner is fresh.
+#
+# Pass/fail counts are NOT pinned: they reflect real-world dialect coverage and
+# move as we fix things. The assertion is intentionally loose: the run must
+# collect many tests AND at least one must pass AND pytest must not crash.
+
+instance:
+  init:
+  - create extension omni_python cascade
+  - insert
+    into
+        omni_python.config (name, value)
+    values
+        ('pip_find_links', '../../../python-wheels'),
+        ('site_packages', 'omni_python_test_sqlalchemy_compliance_full')
+  - query: select omni_python.install_requirements($1)
+    params:
+    - |
+      omni_python
+      omni_python_sqlalchemy
+      pytest>=7
+
+tests:
+
+- name: SA compliance suite, full run (counts surfaced, loose assertion)
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      from omni_python_sqlalchemy.runner import run_compliance_json
+
+      @pg
+      def sa_compliance_full() -> str:
+          return run_compliance_json()
+  - query: |
+      with r as (select sa_compliance_full()::jsonb as j)
+      select (j->>'exit_code')::int >= 0 as exit_code_nonneg,
+             (j->>'passed')::int > 0     as some_tests_passed,
+             ((j->>'passed')::int + (j->>'failed')::int + (j->>'skipped')::int + (j->>'errors')::int) > 100
+                                          as collected_many
+      from r
+    results:
+    - exit_code_nonneg: true
+      some_tests_passed: true
+      collected_many: true
