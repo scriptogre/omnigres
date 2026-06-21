@@ -252,10 +252,22 @@ class Connection:
         # statement execution.
         self.autocommit = False
         self._subxact = None
+        self._server_version_cache = None
         # SQLAlchemy's pg8000 dialect looks up py_types[T] and may also
         # register extra encoders here. We accept everything; plpy handles
         # the real encoding so the entries are essentially metadata.
         self.py_types = _default_py_types()
+
+    @property
+    def server_version(self):
+        """PG server version as an int (psycopg2-compatible). Peewee reads this."""
+        if self._server_version_cache is None:
+            try:
+                row = plpy.execute("SHOW server_version_num")[0]
+                self._server_version_cache = int(row["server_version_num"])
+            except Exception:
+                self._server_version_cache = 0
+        return self._server_version_cache
 
     def __enter__(self):
         return self

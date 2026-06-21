@@ -1,0 +1,17 @@
+[project]
+name = "omni_python_peewee"
+version = "0.1.0"
+description = "Peewee database adapter for omni_python (in-database driver)"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Database"
+]
+
+dependencies = [
+    "omni_python==0.1.0",
+    "peewee>=3.17"
+]

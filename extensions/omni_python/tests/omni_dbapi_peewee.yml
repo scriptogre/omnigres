@@ -1,0 +1,99 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+instance:
+  init:
+  - create extension omni_python cascade
+  - insert
+    into
+        omni_python.config (name, value)
+    values
+        ('pip_find_links', '../../../python-wheels'),
+        ('site_packages', 'omni_python_test_peewee')
+  - query: select omni_python.install_requirements($1)
+    params:
+    - |
+      omni_python
+      omni_python_peewee
+
+tests:
+
+- name: Peewee basic Model CRUD
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import peewee
+      from omni_python_peewee import OmniPythonDatabase
+
+      db = OmniPythonDatabase('omni')
+
+      class Person(peewee.Model):
+          name = peewee.CharField()
+          age = peewee.IntegerField()
+          class Meta:
+              database = db
+              table_name = 'pw_persons'
+
+      @pg
+      def pw_basic() -> str:
+          db.connect(reuse_if_open=True)
+          db.create_tables([Person], safe=True)
+          Person.delete().execute()
+          Person.create(name='Alice', age=30)
+          Person.create(name='Bob', age=25)
+          alice = Person.get(Person.name == 'Alice')
+          if alice.age != 30:
+              return f"alice age {alice.age}"
+          n = Person.select().count()
+          if n != 2:
+              return f"count {n}"
+          # update
+          Person.update(age=31).where(Person.name == 'Alice').execute()
+          if Person.get(Person.name == 'Alice').age != 31:
+              return "update failed"
+          # delete
+          Person.delete().where(Person.name == 'Bob').execute()
+          if Person.select().count() != 1:
+              return "delete failed"
+          return "ok"
+  - query: select pw_basic() as r
+    results:
+      - r: 'ok'
+
+- name: Peewee query expressions and ordering
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import peewee
+      from omni_python_peewee import OmniPythonDatabase
+
+      db = OmniPythonDatabase('omni')
+
+      class Item(peewee.Model):
+          name = peewee.CharField()
+          qty = peewee.IntegerField()
+          class Meta:
+              database = db
+              table_name = 'pw_items'
+
+      @pg
+      def pw_query() -> str:
+          db.connect(reuse_if_open=True)
+          db.create_tables([Item], safe=True)
+          Item.delete().execute()
+          for n, q in [('a', 1), ('b', 5), ('c', 3), ('d', 7), ('e', 2)]:
+              Item.create(name=n, qty=q)
+          names = [i.name for i in Item.select().where(Item.qty >= 3).order_by(Item.qty.desc())]
+          if names != ['d', 'b', 'c']:
+              return f"got {names!r}"
+          total = Item.select(peewee.fn.SUM(Item.qty)).scalar()
+          if total != 18:
+              return f"sum {total}"
+          return "ok"
+  - query: select pw_query() as r
+    results:
+      - r: 'ok'
