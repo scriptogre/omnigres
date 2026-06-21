@@ -1,0 +1,20 @@
+[project]
+name = "omni_python_sqlalchemy"
+version = "0.1.0"
+description = "SQLAlchemy dialect for omni_python (in-database driver)"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Database"
+]
+
+dependencies = [
+    "omni_python==0.1.0",
+    "sqlalchemy>=2.0"
+]
+
+[project.entry-points."sqlalchemy.dialects"]
+"postgresql.omni_python" = "omni_python_sqlalchemy:PGDialect_omni_python"

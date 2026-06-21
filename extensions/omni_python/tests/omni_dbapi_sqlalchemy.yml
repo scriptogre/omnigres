@@ -1,0 +1,179 @@
+$schema: "https://raw.githubusercontent.com/omnigres/omnigres/master/pg_yregress/schema.json"
+instance:
+  init:
+  - create extension omni_python cascade
+  - insert
+    into
+        omni_python.config (name, value)
+    values
+        ('pip_find_links', '../../../python-wheels'),
+        ('site_packages', 'omni_python_test_sqlalchemy')
+  - query: select omni_python.install_requirements($1)
+    params:
+    - |
+      omni_python
+      omni_python_sqlalchemy
+
+tests:
+
+- name: engine SELECT 1 via Core text
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import sqlalchemy as sa
+
+      @pg
+      def sa_text_select() -> int:
+          engine = sa.create_engine("postgresql+omni_python://")
+          with engine.connect() as conn:
+              return conn.execute(sa.text("SELECT 1")).scalar()
+  - query: select sa_text_select() as r
+    results:
+      - r: 1
+
+- name: parameterized text with mixed types
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import sqlalchemy as sa
+
+      @pg
+      def sa_text_params() -> str:
+          engine = sa.create_engine("postgresql+omni_python://")
+          with engine.connect() as conn:
+              row = conn.execute(
+                  sa.text("SELECT :n AS n, :s AS s, :b AS b"),
+                  {"n": 42, "s": "hello", "b": True},
+              ).one()
+              if row.n != 42 or row.s != "hello" or row.b is not True:
+                  return f"got {row!r}"
+              return "ok"
+  - query: select sa_text_params() as r
+    results:
+      - r: 'ok'
+
+- name: Core CRUD on a temp table
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import sqlalchemy as sa
+      from sqlalchemy import Table, Column, Integer, String, MetaData
+
+      @pg
+      def sa_core_crud() -> str:
+          engine = sa.create_engine("postgresql+omni_python://")
+          md = MetaData()
+          users = Table(
+              "sa_users", md,
+              Column("id", Integer, primary_key=True),
+              Column("name", String, nullable=False),
+              prefixes=["TEMPORARY"],
+          )
+          with engine.begin() as conn:
+              md.create_all(conn)
+              conn.execute(users.insert(), [{"id": 1, "name": "Alice"},
+                                            {"id": 2, "name": "Bob"}])
+          with engine.connect() as conn:
+              rows = conn.execute(sa.select(users).order_by(users.c.id)).all()
+              names = [r.name for r in rows]
+              if names != ["Alice", "Bob"]:
+                  return f"got {names!r}"
+              n = conn.execute(sa.select(sa.func.count()).select_from(users)).scalar()
+              if n != 2:
+                  return f"count {n}"
+          return "ok"
+  - query: select sa_core_crud() as r
+    results:
+      - r: 'ok'
+
+- name: ORM with Mapped classes
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import sqlalchemy as sa
+      from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+      class Base(DeclarativeBase):
+          pass
+
+      class Widget(Base):
+          __tablename__ = "sa_widgets"
+          __table_args__ = {"prefixes": ["TEMPORARY"]}
+          id: Mapped[int] = mapped_column(primary_key=True)
+          name: Mapped[str]
+          qty: Mapped[int] = mapped_column(default=0)
+
+      @pg
+      def sa_orm_basic() -> str:
+          engine = sa.create_engine("postgresql+omni_python://")
+          with engine.begin() as conn:
+              Base.metadata.create_all(conn)
+          with Session(engine) as session:
+              session.add_all([
+                  Widget(id=1, name="gear", qty=3),
+                  Widget(id=2, name="bolt", qty=10),
+              ])
+              session.commit()
+              w = session.get(Widget, 1)
+              if w is None or w.name != "gear" or w.qty != 3:
+                  return f"got {w!r}"
+              total = session.scalar(sa.select(sa.func.sum(Widget.qty)))
+              if total != 13:
+                  return f"sum {total}"
+              # filter / update
+              bolt = session.scalar(sa.select(Widget).where(Widget.name == "bolt"))
+              bolt.qty = 99
+              session.commit()
+              again = session.get(Widget, 2)
+              if again.qty != 99:
+                  return f"after update qty {again.qty}"
+          return "ok"
+  - query: select sa_orm_basic() as r
+    results:
+      - r: 'ok'
+
+- name: explicit transaction rollback
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg
+      import sqlalchemy as sa
+      from sqlalchemy import Table, Column, Integer, MetaData
+
+      @pg
+      def sa_tx_rollback() -> str:
+          engine = sa.create_engine("postgresql+omni_python://")
+          md = MetaData()
+          t = Table("sa_tx", md,
+                    Column("v", Integer),
+                    prefixes=["TEMPORARY"])
+          with engine.begin() as conn:
+              md.create_all(conn)
+          try:
+              with engine.begin() as conn:
+                  conn.execute(t.insert(), [{"v": 1}])
+                  raise ValueError("boom")
+          except ValueError:
+              pass
+          with engine.connect() as conn:
+              n = conn.execute(sa.select(sa.func.count()).select_from(t)).scalar()
+              if n != 0:
+                  return f"rollback failed: count={n}"
+          return "ok"
+  - query: select sa_tx_rollback() as r
+    results:
+      - r: 'ok'

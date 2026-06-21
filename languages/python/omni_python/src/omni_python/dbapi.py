@@ -189,6 +189,40 @@ def _pg_type_for(value):
     return ("text", str(value))
 
 
+# --- Default Python-type to PG-OID mapping ---
+# SQLAlchemy's pg8000 dialect looks up py_types[T] to learn the OID for a
+# parameter of Python type T. Our cursor.execute does its own type inference
+# via _pg_type_for, so the encoder slot is a no-op identity.
+
+class _PyTypes(dict):
+    """Dict-like: missing Python types fall back to text+no-op."""
+    def __missing__(self, key):
+        return (25, lambda v: v)  # text OID, identity encoder
+
+
+def _default_py_types():
+    nop = lambda v: v  # noqa: E731
+    return _PyTypes({
+        bool: (16, nop),
+        bytes: (17, nop),
+        bytearray: (17, nop),
+        memoryview: (17, nop),
+        str: (25, nop),
+        int: (20, nop),
+        float: (701, nop),
+        decimal.Decimal: (1700, nop),
+        datetime.date: (1082, nop),
+        datetime.time: (1083, nop),
+        datetime.datetime: (1184, nop),
+        datetime.timedelta: (1186, nop),
+        uuid.UUID: (2950, nop),
+        dict: (3802, nop),
+        list: (1009, nop),
+        tuple: (1009, nop),
+        type(None): (25, nop),
+    })
+
+
 # --- Module-level API ---
 
 def connect(dsn=None, **kwargs):
@@ -213,8 +247,15 @@ class Connection:
 
     def __init__(self):
         self.closed = False
-        self.autocommit = True
+        # Match psycopg2/PEP 249: connections start transactional. SQLAlchemy
+        # and most ORMs expect this; flip explicitly to True for fire-and-forget
+        # statement execution.
+        self.autocommit = False
         self._subxact = None
+        # SQLAlchemy's pg8000 dialect looks up py_types[T] and may also
+        # register extra encoders here. We accept everything; plpy handles
+        # the real encoding so the entries are essentially metadata.
+        self.py_types = _default_py_types()
 
     def __enter__(self):
         return self
@@ -331,6 +372,15 @@ class Cursor:
             else:
                 res = plpy.execute(query)
         except plpy.SPIError as e:
+            # Roll back the subxact so the connection is usable again. PG's
+            # transaction state after an error is "aborted"; any further
+            # statement in the same subxact would also fail. The next
+            # execute() will get a fresh subxact via _ensure_transaction.
+            if self.connection._subxact is not None:
+                try:
+                    self.connection._subxact.exit("error", None, None)
+                finally:
+                    self.connection._subxact = None
             raise _classify(e) from e
 
         self._rows = None
@@ -339,16 +389,26 @@ class Cursor:
         self.rowcount = -1
 
         status = res.status()
-        if status in _RESULT_STATUSES:
+        # Gate on column metadata, not status: SHOW etc. return rows under
+        # SPI_OK_UTILITY, and empty SELECTs still have column descriptions.
+        # plpy raises plpy.Error (not just AttributeError) when there is no
+        # result set, hence the broad except.
+        try:
+            cols = res.colnames()
+        except Exception:
+            cols = None
+
+        if cols:
+            coltypes = res.coltypes()
             self.description = [
-                (name, typeoid, None, None, None, None, None)
-                for name, typeoid in zip(res.colnames(), res.coltypes())
+                (n, t, None, None, None, None, None)
+                for n, t in zip(cols, coltypes)
             ]
             raw_rows = [tuple(row[col] for col in row.keys()) for row in res]
             self._rows = [_convert_row(r, self.description) for r in raw_rows]
             self.rownumber = 0
-
-        if status == _SPI_OK_UTILITY:
+            self.rowcount = len(self._rows)
+        elif status == _SPI_OK_UTILITY:
             self.rowcount = -1
         else:
             self.rowcount = res.nrows()
@@ -371,9 +431,9 @@ class Cursor:
 
     def fetchone(self):
         self._check_open()
-        if self._rows is None:
-            raise InterfaceError("No result set; call execute() first")
-        if self.rownumber >= len(self._rows):
+        # PEP 249 says raise if no result set, but SQLAlchemy calls fetchone()
+        # routinely after DDL etc. Returning None is the practical convention.
+        if not self._rows or self.rownumber >= len(self._rows):
             return None
         row = self._rows[self.rownumber]
         self.rownumber += 1
@@ -381,8 +441,8 @@ class Cursor:
 
     def fetchmany(self, size=None):
         self._check_open()
-        if self._rows is None:
-            raise InterfaceError("No result set; call execute() first")
+        if not self._rows:
+            return []
         if size is None:
             size = self.arraysize
         end = min(self.rownumber + size, len(self._rows))
@@ -392,8 +452,8 @@ class Cursor:
 
     def fetchall(self):
         self._check_open()
-        if self._rows is None:
-            raise InterfaceError("No result set; call execute() first")
+        if not self._rows:
+            return []
         result = self._rows[self.rownumber:]
         self.rownumber = len(self._rows)
         return result
