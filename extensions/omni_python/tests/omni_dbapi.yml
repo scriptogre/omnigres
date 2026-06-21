@@ -18,6 +18,9 @@ instance:
         salary integer not null)
 
 tests:
+
+# --- basic ---
+
 - name: simple connect
   steps:
   - query: select * from omni_python.create_functions($1)
@@ -28,7 +31,7 @@ tests:
 
       @pg
       def get_one() -> int:
-          conn = dbapi.connect();
+          conn = dbapi.connect()
           cur = conn.cursor()
           cur.execute('SELECT 1')
           res = cur.fetchone()
@@ -38,6 +41,291 @@ tests:
     results:
      - res: 1
 
+- name: module attributes
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def attrs() -> str:
+          if dbapi.apilevel != "2.0":
+              return f"apilevel={dbapi.apilevel}"
+          if dbapi.threadsafety != 1:
+              return f"threadsafety={dbapi.threadsafety}"
+          if dbapi.paramstyle != "format":
+              return f"paramstyle={dbapi.paramstyle}"
+          return "ok"
+  - query: select attrs() as r
+    results:
+      - r: 'ok'
+
+- name: connect ignores DSN and kwargs
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def conn_dsn() -> str:
+          c = dbapi.connect("postgresql://ignored:ignored@nowhere/none", user="x", password="y")
+          c.close()
+          return "ok"
+  - query: select conn_dsn() as r
+    results:
+      - r: 'ok'
+
+# --- type round-trips ---
+
+- name: int round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_int() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              for v in (0, 1, -1, 32767, -32768, 2147483647, -2147483648, 9223372036854775807):
+                  cur.execute("SELECT %s::bigint", [v])
+                  r = cur.fetchone()
+                  if r[0] != v:
+                      return f"int {v}: got {r[0]!r}"
+          return "ok"
+  - query: select rt_int() as r
+    results:
+      - r: 'ok'
+
+- name: float round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_float() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              for v in (0.0, 1.5, -1.5, 1.756e-12, 3.14159265358979):
+                  cur.execute("SELECT %s::float8", [v])
+                  r = cur.fetchone()
+                  if r[0] != v:
+                      return f"float {v}: got {r[0]!r}"
+          return "ok"
+  - query: select rt_float() as r
+    results:
+      - r: 'ok'
+
+- name: decimal round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+      from decimal import Decimal
+
+      @pg
+      def rt_decimal() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              for s in ("1.1", "-1.1", "10000", "-1000000000.123456789"):
+                  v = Decimal(s)
+                  cur.execute("SELECT %s::numeric", [v])
+                  r = cur.fetchone()
+                  if r[0] != v:
+                      return f"decimal {s}: got {r[0]!r}"
+          return "ok"
+  - query: select rt_decimal() as r
+    results:
+      - r: 'ok'
+
+- name: bool round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_bool() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              for v in (True, False):
+                  cur.execute("SELECT %s::bool", [v])
+                  r = cur.fetchone()
+                  if r[0] is not v:
+                      return f"bool {v}: got {r[0]!r}"
+          return "ok"
+  - query: select rt_bool() as r
+    results:
+      - r: 'ok'
+
+- name: str round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_str() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              for v in ("hello", "with 'quotes'", "unicode ųÿ"):
+                  cur.execute("SELECT %s::text", [v])
+                  r = cur.fetchone()
+                  if r[0] != v:
+                      return f"str {v!r}: got {r[0]!r}"
+          return "ok"
+  - query: select rt_str() as r
+    results:
+      - r: 'ok'
+
+- name: bytes round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_bytes() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              v = b"\x00\x01\xff hello"
+              cur.execute("SELECT %s::bytea", [v])
+              r = cur.fetchone()
+              if r[0] != v:
+                  return f"bytes: got {r[0]!r}"
+          return "ok"
+  - query: select rt_bytes() as r
+    results:
+      - r: 'ok'
+
+- name: date and time round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+      from datetime import date, time, datetime
+
+      @pg
+      def rt_datetimes() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              d = date(2024, 1, 15)
+              cur.execute("SELECT %s::date", [d])
+              got = cur.fetchone()[0]
+              if got != d:
+                  return f"date: got {got!r} ({type(got).__name__})"
+              t = time(14, 30, 45)
+              cur.execute("SELECT %s::time", [t])
+              got = cur.fetchone()[0]
+              if got != t:
+                  return f"time: got {got!r} ({type(got).__name__})"
+              ts = datetime(2024, 1, 15, 14, 30, 45)
+              cur.execute("SELECT %s::timestamp", [ts])
+              got = cur.fetchone()[0]
+              if got != ts:
+                  return f"timestamp: got {got!r} ({type(got).__name__})"
+          return "ok"
+  - query: select rt_datetimes() as r
+    results:
+      - r: 'ok'
+
+- name: uuid round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+      import uuid
+
+      @pg
+      def rt_uuid() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              u = uuid.UUID("12345678-1234-5678-1234-567812345678")
+              cur.execute("SELECT %s::uuid", [u])
+              r = cur.fetchone()
+              if str(r[0]) != str(u):
+                  return f"uuid: got {r[0]!r}"
+          return "ok"
+  - query: select rt_uuid() as r
+    results:
+      - r: 'ok'
+
+- name: jsonb round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_jsonb() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              v = {"a": 1, "b": [2, 3], "c": "hello"}
+              cur.execute("SELECT (%s::jsonb)->>'c'", [v])
+              r = cur.fetchone()
+              if r[0] != "hello":
+                  return f"jsonb: got {r[0]!r}"
+          return "ok"
+  - query: select rt_jsonb() as r
+    results:
+      - r: 'ok'
+
+- name: array round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_array() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              v = [1, 2, 3, 4]
+              cur.execute("SELECT %s::int8[]", [v])
+              r = cur.fetchone()
+              if list(r[0]) != v:
+                  return f"int8[]: got {r[0]!r}"
+          return "ok"
+  - query: select rt_array() as r
+    results:
+      - r: 'ok'
+
+- name: null round-trip
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def rt_null() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              cur.execute("SELECT %s::text", [None])
+              r = cur.fetchone()
+              if r[0] is not None:
+                  return f"null: got {r[0]!r}"
+          return "ok"
+  - query: select rt_null() as r
+    results:
+      - r: 'ok'
+
+# --- existing autocommit + write-path scenarios ---
 
 - name: autocommit
   steps:
@@ -79,7 +367,6 @@ tests:
               return "Failed"
           cur.close()
           conn.close()
-
           return "Success"
   - query: select insert_employee_no_autocommit('Bill', 'Accounting', 80) as res
     results:
@@ -97,6 +384,188 @@ tests:
         name: 'Tony'
         department: 'Marketing'
         salary: 60
-        
-        
 
+# --- INSERT/UPDATE/DELETE with RETURNING ---
+
+- name: insert returning
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_returning() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              cur.execute("CREATE TEMP TABLE t_ret (id serial PRIMARY KEY, v text)")
+              cur.execute("INSERT INTO t_ret (v) VALUES (%s) RETURNING id, v", ["hello"])
+              r = cur.fetchone()
+              if r[0] != 1 or r[1] != "hello":
+                  return f"got {r!r}"
+              if cur.rowcount != 1:
+                  return f"rowcount {cur.rowcount}"
+          return "ok"
+  - query: select t_returning() as r
+    results:
+      - r: 'ok'
+
+# --- executemany ---
+
+- name: executemany
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_em() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              cur.execute("CREATE TEMP TABLE t_em (v int)")
+              cur.executemany("INSERT INTO t_em VALUES (%s)", [[1], [2], [3]])
+              cur.execute("SELECT count(*), sum(v) FROM t_em")
+              r = cur.fetchone()
+              if r[0] != 3 or r[1] != 6:
+                  return f"got {r!r}"
+          return "ok"
+  - query: select t_em() as r
+    results:
+      - r: 'ok'
+
+# --- empty fetch ---
+
+- name: fetch on empty result set
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_empty() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              cur.execute("SELECT 1 WHERE false")
+              if cur.fetchone() is not None:
+                  return "fetchone should return None"
+              if cur.fetchmany(10) != []:
+                  return "fetchmany should return []"
+              if cur.fetchall() != []:
+                  return "fetchall should return []"
+              if cur.rowcount != 0:
+                  return f"rowcount {cur.rowcount}"
+          return "ok"
+  - query: select t_empty() as r
+    results:
+      - r: 'ok'
+
+# --- error classification ---
+
+- name: integrity error has pgcode
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_integrity() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              cur.execute("CREATE TEMP TABLE t_uq (id int PRIMARY KEY)")
+              cur.execute("INSERT INTO t_uq VALUES (1)")
+              try:
+                  cur.execute("INSERT INTO t_uq VALUES (1)")
+                  return "no exception raised"
+              except dbapi.IntegrityError as e:
+                  if e.pgcode != "23505":
+                      return f"pgcode {e.pgcode}"
+                  return "ok"
+              except Exception as e:
+                  return f"wrong type: {type(e).__name__}: {e}"
+  - query: select t_integrity() as r
+    results:
+      - r: 'ok'
+
+- name: programming error on syntax
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_syntax() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              try:
+                  cur.execute("SELEC nope")
+                  return "no exception raised"
+              except dbapi.ProgrammingError as e:
+                  if not (e.pgcode or "").startswith("42"):
+                      return f"pgcode {e.pgcode}"
+                  return "ok"
+              except Exception as e:
+                  return f"wrong type: {type(e).__name__}"
+  - query: select t_syntax() as r
+    results:
+      - r: 'ok'
+
+# --- iterator protocol ---
+
+- name: cursor is iterable
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_iter() -> str:
+          with dbapi.connect() as c, c.cursor() as cur:
+              cur.execute("SELECT generate_series(1, 5)")
+              total = sum(row[0] for row in cur)
+              if total != 15:
+                  return f"sum {total}"
+          return "ok"
+  - query: select t_iter() as r
+    results:
+      - r: 'ok'
+
+# --- context manager: rollback on exception ---
+
+- name: context manager rolls back on exception
+  steps:
+  - query: select * from omni_python.create_functions($1)
+    params:
+    #language=Python
+    - |
+      from omni_python import pg, dbapi
+
+      @pg
+      def t_ctx_rollback() -> str:
+          conn = dbapi.connect()
+          conn.autocommit = False
+          cur = conn.cursor()
+          cur.execute("CREATE TABLE IF NOT EXISTS t_ctx_rb (v int)")
+          cur.execute("DELETE FROM t_ctx_rb")
+          conn.commit()
+          try:
+              with conn:
+                  with conn.cursor() as cur2:
+                      cur2.execute("INSERT INTO t_ctx_rb VALUES (1)")
+                      raise ValueError("boom")
+          except ValueError:
+              pass
+          cur.execute("SELECT count(*) FROM t_ctx_rb")
+          n = cur.fetchone()[0]
+          conn.close()
+          if n != 0:
+              return f"rollback failed, count={n}"
+          return "ok"
+  - query: select t_ctx_rollback() as r
+    results:
+      - r: 'ok'

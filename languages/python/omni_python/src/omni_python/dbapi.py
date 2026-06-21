@@ -1,101 +1,203 @@
 """
-plpydbapi
+Python DB-API 2.0 driver for omni_python, on top of PL/Python's plpy.
 
-Copyright (c) 2011, Peter Eisentraut
+PEP 249: https://peps.python.org/pep-0249/
 
-Permission to use, copy, modify, and distribute this software and its
-documentation for any purpose, without fee, and without a written
-agreement is hereby granted, provided that the above copyright notice
-and this paragraph and the following two paragraphs appear in all
-copies.
-
-IN NO EVENT SHALL THE AUTHORS BE LIABLE TO ANY PARTY FOR DIRECT,
-INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
-LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
-DOCUMENTATION, EVEN IF THE AUTHORS HAVE BEEN ADVISED OF THE
-POSSIBILITY OF SUCH DAMAGE.
-
-THE AUTHORS SPECIFICALLY DISCLAIM ANY WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE. THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
-BASIS, AND THE AUTHORS HAVE NO OBLIGATIONS TO PROVIDE MAINTENANCE,
-SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
-
-(The PostgreSQL License, http://www.opensource.org/licenses/postgresql)
+Skeleton from plpydbapi by Peter Eisentraut (PostgreSQL License).
+Type-mapping and exception-classification ideas inspired by pg8000 (BSD-3)
+and psycopg2's sqlstate categories.
 """
-
-"""
-A Python DB-API compatible (sort of) interface on top of PL/Python
-"""
-
-__author__ = "Peter Eisentraut <peter@eisentraut.org>"
-
 
 import datetime
 import decimal
-import plpy
-import sys
+import json
 import time
+import uuid
+
+import plpy
 
 
-__plpy = sys.modules['__main__'].plpy
+# --- PEP 249 module globals ---
+
+apilevel = "2.0"
+threadsafety = 1  # Threads may share the module, not connections/cursors.
+paramstyle = "format"  # %s placeholders, converted to $N internally.
 
 
-## Module Interface
+# --- Exception hierarchy (PEP 249 section 6.1) ---
 
-
-def connect():
-    return Connection()
-
-
-apilevel = '2.0'
-threadsafety = 0  # Threads may not share the module.
-paramstyle = 'format'
-
-
-class Warning(Exception):
+class Warning(Exception):  # noqa: A001, DB-API mandates this name
     pass
 
 
 class Error(Exception):
-    def __init__(self, spierror=None):
-        super(Error, self).__init__()
+    """Base of all DB-API errors. Carries pgcode/diag from plpy.SPIError."""
+
+    def __init__(self, message="", spierror=None):
+        super().__init__(message)
         self.spierror = spierror
+        if spierror is not None:
+            self.pgcode = getattr(spierror, "sqlstate", None)
+            self.pgerror = str(spierror)
+            self.diag = _Diag(spierror)
+        else:
+            self.pgcode = None
+            self.pgerror = None
+            self.diag = None
 
 
-class InterfaceError(Error):
-    pass
+class InterfaceError(Error): pass
+class DatabaseError(Error): pass
+class DataError(DatabaseError): pass
+class OperationalError(DatabaseError): pass
+class IntegrityError(DatabaseError): pass
+class InternalError(DatabaseError): pass
+class ProgrammingError(DatabaseError): pass
+class NotSupportedError(DatabaseError): pass
 
 
-class DatabaseError(Error):
-    pass
+class _Diag:
+    """psycopg2-style diagnostics object attached to Error."""
+    __slots__ = ("sqlstate", "message_primary", "message_detail", "message_hint",
+                 "context", "schema_name", "table_name", "column_name",
+                 "datatype_name", "constraint_name")
+
+    def __init__(self, e):
+        self.sqlstate = getattr(e, "sqlstate", None)
+        self.message_primary = str(e)
+        self.message_detail = getattr(e, "detail", None)
+        self.message_hint = getattr(e, "hint", None)
+        for attr in ("context", "schema_name", "table_name", "column_name",
+                     "datatype_name", "constraint_name"):
+            setattr(self, attr, getattr(e, attr, None))
 
 
-class DataError(DatabaseError):
-    pass
+# Postgres SQLSTATE class code to DB-API exception subclass.
+# https://www.postgresql.org/docs/current/errcodes-appendix.html
+_SQLSTATE_CLASS_MAP = {
+    "0A": NotSupportedError,
+    "20": ProgrammingError, "21": ProgrammingError,
+    "22": DataError,
+    "23": IntegrityError,
+    "24": InternalError, "25": InternalError,
+    "26": ProgrammingError, "27": OperationalError, "28": OperationalError,
+    "2B": IntegrityError, "2D": InternalError, "2F": OperationalError,
+    "34": ProgrammingError,
+    "38": InternalError, "39": InternalError, "3B": InternalError,
+    "3D": ProgrammingError, "3F": ProgrammingError,
+    "40": OperationalError,
+    "42": ProgrammingError, "44": ProgrammingError,
+    "53": OperationalError, "54": OperationalError, "55": OperationalError,
+    "57": OperationalError, "58": OperationalError,
+    "F0": InternalError, "P0": InternalError, "XX": InternalError,
+}
 
 
-class OperationalError(DatabaseError):
-    pass
+def _classify(spierror):
+    sqlstate = getattr(spierror, "sqlstate", None) or ""
+    cls = _SQLSTATE_CLASS_MAP.get(sqlstate[:2], DatabaseError)
+    return cls(str(spierror), spierror=spierror)
 
 
-class IntegrityError(DatabaseError):
-    pass
+# --- Result-side type conversion ---
+# plpy converts only a handful of base types (bool, int*, float*, numeric,
+# text, bytea) to Python objects. Everything else comes back as the PG string
+# representation. We map the well-known OIDs to Python builtins here.
+
+def _parse_timestamp(s):
+    return datetime.datetime.fromisoformat(s.replace(" ", "T", 1))
 
 
-class InternalError(DatabaseError):
-    pass
+def _parse_timestamptz(s):
+    s = s.replace(" ", "T", 1)
+    # PG may emit '+00' or '+0000' rather than '+00:00'; pad to ISO 8601.
+    if len(s) >= 3 and s[-3] in "+-" and ":" not in s[-3:]:
+        s = s + ":00"
+    return datetime.datetime.fromisoformat(s)
 
 
-class ProgrammingError(DatabaseError):
-    pass
+# PG type OID, see src/include/catalog/pg_type.dat.
+_RESULT_CONVERTERS = {
+    1082: datetime.date.fromisoformat,    # date
+    1083: datetime.time.fromisoformat,    # time
+    1114: _parse_timestamp,               # timestamp
+    1184: _parse_timestamptz,             # timestamptz
+    2950: uuid.UUID,                      # uuid
+}
 
 
-class NotSupportedError(DatabaseError):
-    pass
+def _convert_row(row, description):
+    """Apply OID-based converters to each string-valued cell in a row."""
+    out = []
+    for i, val in enumerate(row):
+        if isinstance(val, str) and description:
+            conv = _RESULT_CONVERTERS.get(description[i][1])
+            if conv is not None:
+                try:
+                    val = conv(val)
+                except (ValueError, TypeError):
+                    pass  # leave as string on parse failure
+        out.append(val)
+    return tuple(out)
 
-## Connection Objects
 
+# --- Type mapping (param side) ---
+
+def _json_default(obj):
+    if isinstance(obj, decimal.Decimal):
+        return str(obj)
+    if isinstance(obj, (datetime.date, datetime.time, datetime.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _pg_type_for(value):
+    """Return (pg_type_name, coerced_value) for one Python parameter."""
+    if value is None:
+        return ("text", None)
+    if isinstance(value, bool):  # before int (bool is a subclass of int)
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int8", value)
+    if isinstance(value, float):
+        return ("float8", value)
+    if isinstance(value, decimal.Decimal):
+        return ("numeric", value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return ("bytea", bytes(value))
+    if isinstance(value, datetime.datetime):
+        return (("timestamptz" if value.tzinfo else "timestamp"), value)
+    if isinstance(value, datetime.date):
+        return ("date", value)
+    if isinstance(value, datetime.time):
+        return ("time", value)
+    if isinstance(value, datetime.timedelta):
+        return ("interval", value)
+    if isinstance(value, uuid.UUID):
+        return ("uuid", str(value))
+    if isinstance(value, dict):
+        return ("jsonb", json.dumps(value, default=_json_default))
+    if isinstance(value, (list, tuple)):
+        if value:
+            elem_type, _ = _pg_type_for(value[0])
+            return (f"{elem_type}[]", list(value))
+        return ("text[]", [])
+    if isinstance(value, str):
+        return ("text", value)
+    return ("text", str(value))
+
+
+# --- Module-level API ---
+
+def connect(dsn=None, **kwargs):
+    """Return a Connection. Accepts and ignores DSN/kwargs so SQLAlchemy-style
+    URLs do not blow up; we are already inside the database."""
+    return Connection()
+
+
+# --- Connection ---
 
 class Connection:
     Warning = Warning
@@ -109,14 +211,10 @@ class Connection:
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
 
-    closed = False
-    autocommit = True
-
-
-    _subxact = None
-
     def __init__(self):
-        pass
+        self.closed = False
+        self.autocommit = True
+        self._subxact = None
 
     def __enter__(self):
         return self
@@ -131,7 +229,7 @@ class Connection:
 
     def close(self):
         if self.closed:
-            raise Error()
+            raise InterfaceError("Connection already closed")
         self.rollback()
         self.closed = True
 
@@ -142,45 +240,47 @@ class Connection:
 
     def commit(self):
         if self.closed:
-            raise Error()
+            raise InterfaceError("Connection is closed")
         if self._subxact is not None:
             self._subxact.exit(None, None, None)
-        self._subxact = None
+            self._subxact = None
 
     def rollback(self):
         if self.closed:
-            raise Error()
+            raise InterfaceError("Connection is closed")
         if self._subxact is not None:
-            self._subxact.exit('fake exception', None, None)
-        self._subxact = None
+            self._subxact.exit("rollback", None, None)
+            self._subxact = None
 
     def cursor(self):
-        newcursor = Cursor()
-        newcursor.connection = self
-        return newcursor
+        if self.closed:
+            raise InterfaceError("Connection is closed")
+        return Cursor(self)
 
 
-## Cursor Objects
+# --- Cursor ---
+
+# SPI status codes from PG (executor/spi.h). Inlined to avoid C import.
+_SPI_OK_UTILITY = 4
+_SPI_OK_SELECT = 5
+_SPI_OK_INSERT_RETURNING = 11
+_SPI_OK_DELETE_RETURNING = 12
+_SPI_OK_UPDATE_RETURNING = 13
+_RESULT_STATUSES = {_SPI_OK_SELECT, _SPI_OK_INSERT_RETURNING,
+                    _SPI_OK_DELETE_RETURNING, _SPI_OK_UPDATE_RETURNING}
 
 
 class Cursor:
-    description = None
-    rowcount = -1
     arraysize = 1
-    rownumber = None
-    closed = False
-    connection = None
 
-    _execute_result = None
-
-    _SPI_OK_UTILITY = 4
-    _SPI_OK_SELECT = 5
-    _SPI_OK_INSERT_RETURNING = 11
-    _SPI_OK_DELETE_RETURNING = 12
-    _SPI_OK_UPDATE_RETURNING = 13
-
-    def __init__(self):
-        pass
+    def __init__(self, connection):
+        self.connection = connection
+        self.closed = False
+        self.description = None
+        self.rowcount = -1
+        self.rownumber = None
+        self.lastrowid = None
+        self._rows = None
 
     def __enter__(self):
         return self
@@ -188,140 +288,135 @@ class Cursor:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    next = __next__  # legacy
+
     def close(self):
         self.closed = True
 
-    def _is_closed(self):
-        return self.closed or self.connection.closed
+    def _check_open(self):
+        if self.closed:
+            raise InterfaceError("Cursor is closed")
+        if self.connection.closed:
+            raise InterfaceError("Connection is closed")
 
     def execute(self, operation, parameters=None):
-        if self._is_closed():
-            raise Error()
-
+        self._check_open()
         self.connection._ensure_transaction()
 
-        parameters = parameters or []
-
-        placeholders = []
-        types = []
-        values = []
+        parameters = list(parameters) if parameters else []
+        types, values, placeholders = [], [], []
         for i, param in enumerate(parameters):
-            placeholders.append("$%d" % (i + 1))
-            types.append(self.py_param_to_pg_type(param))
-            values.append(param)
-        try:
-            query = operation % placeholders
-            plan = plpy.prepare(query, types)
-            res = plpy.execute(plan, values)
-        except plpy.SPIError as e:
-            raise Error(e)
+            pg_type, coerced = _pg_type_for(param)
+            types.append(pg_type)
+            values.append(coerced)
+            placeholders.append(f"${i+1}")
 
-        self._execute_result = None
+        try:
+            if parameters and "%s" in operation:
+                query = operation % tuple(placeholders)
+            else:
+                query = operation  # native $N or no params
+            if types:
+                plan = plpy.prepare(query, types)
+                res = plpy.execute(plan, values)
+            else:
+                res = plpy.execute(query)
+        except plpy.SPIError as e:
+            raise _classify(e) from e
+
+        self._rows = None
         self.rownumber = None
         self.description = None
         self.rowcount = -1
 
-
-        if res.status() in (self._SPI_OK_SELECT, self._SPI_OK_INSERT_RETURNING, self._SPI_OK_DELETE_RETURNING, self._SPI_OK_UPDATE_RETURNING):
-            self._execute_result = [[row[col] for col in row] for row in res]
+        status = res.status()
+        if status in _RESULT_STATUSES:
+            self.description = [
+                (name, typeoid, None, None, None, None, None)
+                for name, typeoid in zip(res.colnames(), res.coltypes())
+            ]
+            raw_rows = [tuple(row[col] for col in row.keys()) for row in res]
+            self._rows = [_convert_row(r, self.description) for r in raw_rows]
             self.rownumber = 0
-            if 'colnames' in res.__class__.__dict__:
-                # PG 9.2+: use .colnames() and .coltypes() methods
-                self.description = [(name, get_type_obj(typeoid), None, None, None, None, None) for name, typeoid in zip(res.colnames(), res.coltypes())]
-            elif len(res) > 0:
-                # else get at least the column names from the row keys
-                self.description = [(name, None, None, None, None, None, None) for name in res[0].keys()]
-            else:
-                # else we know nothing
-                self.description = [(None, None, None, None, None, None, None)]
 
-        if res.status() == self._SPI_OK_UTILITY:
+        if status == _SPI_OK_UTILITY:
             self.rowcount = -1
         else:
             self.rowcount = res.nrows()
 
-        if self.connection.autocommit == True:
+        if self.connection.autocommit:
             self.connection.commit()
 
-    @staticmethod
-    def py_param_to_pg_type(param):
-        if isinstance(param, bool):
-            pgtype = 'bool'
-        elif isinstance(param, decimal.Decimal):
-            pgtype = 'numeric'
-        elif isinstance(param, float):
-            pgtype = 'float8'
-        elif isinstance(param, int):
-            pgtype = 'int'
-        else:
-            pgtype = 'text'
-        # TODO ...
-        return pgtype
+        return self
 
     def executemany(self, operation, seq_of_parameters):
-        # We can't reuse saved plans here, because we have no way of
-        # knowing whether all parameter sets will be of the same type.
-        totalcount = 0
-        for parameters in seq_of_parameters:
-            self.execute(operation, parameters)
-            if totalcount != -1:
-                totalcount += self.rowcount
-        self.rowcount = totalcount
+        self._check_open()
+        total = 0
+        for params in seq_of_parameters:
+            self.execute(operation, params)
+            if self.rowcount >= 0 and total >= 0:
+                total += self.rowcount
+            else:
+                total = -1
+        self.rowcount = total
 
     def fetchone(self):
-        if self._execute_result is None:
-            raise Error()
-        if self.rownumber == len(self._execute_result):
+        self._check_open()
+        if self._rows is None:
+            raise InterfaceError("No result set; call execute() first")
+        if self.rownumber >= len(self._rows):
             return None
-        result = self._execute_result[self.rownumber]
+        row = self._rows[self.rownumber]
         self.rownumber += 1
-        return result
+        return row
 
     def fetchmany(self, size=None):
-        if self._execute_result is None:
-            raise Error()
+        self._check_open()
+        if self._rows is None:
+            raise InterfaceError("No result set; call execute() first")
         if size is None:
             size = self.arraysize
-        result = self._execute_result[self.rownumber:self.rownumber + size]
-        self.rownumber += size
+        end = min(self.rownumber + size, len(self._rows))
+        result = self._rows[self.rownumber:end]
+        self.rownumber = end
         return result
 
     def fetchall(self):
-        if self._execute_result is None:
-            raise Error()
-        result = self._execute_result[self.rownumber:]
-        self.rownumber = len(self._execute_result)
+        self._check_open()
+        if self._rows is None:
+            raise InterfaceError("No result set; call execute() first")
+        result = self._rows[self.rownumber:]
+        self.rownumber = len(self._rows)
         return result
 
-    def next(self):
-        result = self.fetchone()
-        if result is None:
-            raise StopIteration
-        return result
-
-    def scroll(self, value, mode='relative'):
-        if mode == 'relative':
+    def scroll(self, value, mode="relative"):
+        self._check_open()
+        if self._rows is None:
+            raise InterfaceError("No result set")
+        if mode == "relative":
             newpos = self.rownumber + value
-        elif mode == 'absolute':
+        elif mode == "absolute":
             newpos = value
         else:
-            raise ValueError("Invalid mode")
-        if newpos < 0 or newpos > len(self._execute_result):
-            raise IndexError("scroll operation would leave result set")
+            raise ProgrammingError(f"Invalid scroll mode: {mode}")
+        if newpos < 0 or newpos > len(self._rows):
+            raise IndexError("scroll out of range")
         self.rownumber = newpos
 
-    def setinputsizes(self, sizes):
-        pass
-
-    def setoutputsize(self, size, column=None):
-        pass
-
-    def __iter__(self):
-        return self
+    def setinputsizes(self, sizes): pass
+    def setoutputsize(self, size, column=None): pass
 
 
-## Type Objects and Constructors
-
+# --- DB-API 2.0 type constructors (PEP 249 section 7) ---
 
 def Date(year, month, day):
     return datetime.date(year, month, day)
@@ -348,56 +443,26 @@ def TimestampFromTicks(ticks):
 
 
 def Binary(value):
-    return value if isinstance(value, (bytes, bytearray, memoryview)) else bytes(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return value
+    return bytes(value)
 
 
-# Type objects
+# DB-API type-object sentinels (PEP 249 section 7.2).
+class STRING: pass
+class BINARY: pass
+class NUMBER: pass
+class DATETIME: pass
+class ROWID: pass
 
 
-class STRING:
-    pass
-
-
-class BINARY:
-    pass
-
-
-class NUMBER:
-    pass
-
-
-class DATETIME:
-    pass
-
-
-class ROWID:
-    pass
-
-
-_typname_typeobjs = {
-    'bytea': BINARY,
-}
-
-
-_typcategory_typeobjs = {
-    'D': DATETIME,
-    'N': NUMBER,
-    'S': STRING,
-    'T': DATETIME,
-}
-
-
-_typoid_typeobjs = {}
-
-
-def get_type_obj(typeoid):
-    """Return the type object (STRING, NUMBER, etc.) that corresponds
-    to the given type OID."""
-    if not _typoid_typeobjs:
-        for row in plpy.execute(plpy.prepare("SELECT oid, typname, typcategory FROM pg_type")):
-            if row['typcategory'] in _typcategory_typeobjs:
-                _typoid_typeobjs[int(row['oid'])] = _typcategory_typeobjs[row['typcategory']]
-            elif row['typname'] in _typname_typeobjs:
-                _typoid_typeobjs[int(row['oid'])] = _typname_typeobjs[row['typname']]
-
-    return _typoid_typeobjs.get(typeoid)
+__all__ = [
+    "apilevel", "threadsafety", "paramstyle", "connect",
+    "Warning", "Error", "InterfaceError", "DatabaseError",
+    "DataError", "OperationalError", "IntegrityError", "InternalError",
+    "ProgrammingError", "NotSupportedError",
+    "Connection", "Cursor",
+    "Date", "Time", "Timestamp",
+    "DateFromTicks", "TimeFromTicks", "TimestampFromTicks", "Binary",
+    "STRING", "BINARY", "NUMBER", "DATETIME", "ROWID",
+]
